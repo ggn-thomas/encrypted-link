@@ -1,120 +1,149 @@
-# Structure of this project
+# Encrypted Link
 
-This project is structured pretty similarly to how a regular Solana Anchor project is structured. The main difference lies in there being two places to write code here:
+Privacy-preserving wallet linking system built on [Arcium](https://arcium.com/). Stores the association between users and their Solana wallet public keys **without ever storing the public key in cleartext** on-chain.
 
-- The `programs` dir like usual Anchor programs
-- The `encrypted-ixs` dir for confidential computing instructions
+## How it works
 
-When working with plaintext data, we can edit it inside our program as normal. When working with confidential data though, state transitions take place off-chain using the Arcium network as a co-processor. For this, we then always need two instructions in our program: one that gets called to initialize a confidential computation, and one that gets called when the computation is done and supplies the resulting data. Additionally, since the types and operations in a Solana program and in a confidential computing environment are a bit different, we define the operations themselves in the `encrypted-ixs` dir using our Rust-based framework called Arcis. To link all of this together, we provide a few macros that take care of ensuring the correct accounts and data are passed for the specific initialization and callback functions:
+The system uses Arcium's Multi-Party Computation (MPC) network as a confidential co-processor. A secret **salt** is generated and stored encrypted on-chain — only the MPC nodes can decrypt it. When a user links their wallet, the MPC hashes `wallet_pubkey || salt` using SHA3-256 and returns an encrypted **commitment**. To verify ownership later, the MPC re-hashes the claimed wallet with the same salt and compares.
 
-```rust
-// encrypted-ixs/add_together.rs
+```
+                  ┌──────────────────────────────┐
+  Signup          │       Arcium MPC Cluster      │
+  ──────────►     │  SHA3_256(wallet || salt)      │  ──────► commitment (encrypted)
+  wallet pubkey   │  salt read from on-chain       │          stored off-chain by app
+  (encrypted)     └──────────────────────────────┘
 
-use arcis::*;
+                  ┌──────────────────────────────┐
+  Signin          │       Arcium MPC Cluster      │
+  ──────────►     │  SHA3_256(wallet || salt)      │  ──────► match: 1 or 0 (encrypted)
+  wallet pubkey   │  compare with commitment       │
+  + commitment    └──────────────────────────────┘
+```
 
-#[encrypted]
-mod circuits {
-    use arcis::*;
+**Key properties:**
+- The wallet public key is **never** stored or visible on-chain
+- The salt is MXE-encrypted — only the MPC cluster can read it
+- Commitments are returned encrypted to the caller via a shared key
+- Verification is a constant-time byte comparison inside the MPC
 
-    pub struct InputValues {
-        v1: u8,
-        v2: u8,
-    }
+## Project structure
 
-    #[instruction]
-    pub fn add_together(input_ctxt: Enc<Shared, InputValues>) -> Enc<Shared, u16> {
-        let input = input_ctxt.to_arcis();
-        let sum = input.v1 as u16 + input.v2 as u16;
-        input_ctxt.owner.from_arcis(sum)
-    }
-}
+```
+├── encrypted-ixs/src/lib.rs    # Arcis circuits (MPC logic)
+├── programs/encrypted_link/     # Solana Anchor program
+│   └── src/lib.rs
+├── tests/encrypted_link.ts      # Integration tests
+├── run_test.sh                  # Test runner (Apple Silicon compatible)
+├── Anchor.toml
+└── Arcium.toml
+```
 
-// programs/my_program/src/lib.rs
+### Circuits (`encrypted-ixs/`)
 
-use anchor_lang::prelude::*;
-use arcium_anchor::prelude::*;
+Written in [Arcis](https://docs.arcium.com/developers/arcis), Arcium's Rust-based circuit language:
 
-declare_id!("<some ID>");
+| Circuit | Input | Output | Description |
+|---------|-------|--------|-------------|
+| `init_salt` | `Enc<Shared, SaltInput>` | `Enc<Mxe, Salt>` | Generates and stores the MXE-encrypted salt on-chain |
+| `store_wallet` | `Enc<Shared, WalletInput>` + `Enc<Mxe, &Salt>` | `Enc<Shared, Commitment>` | Hashes wallet+salt, returns commitment to caller |
+| `verify_wallet` | `Enc<Shared, VerifyInput>` + `Enc<Mxe, &Salt>` | `Enc<Shared, u8>` | Re-hashes and compares, returns 1 (match) or 0 |
 
-#[arcium_program]
-pub mod my_program {
-    use super::*;
+### Solana program (`programs/`)
 
-    pub fn init_add_together_comp_def(ctx: Context<InitAddTogetherCompDef>) -> Result<()> {
-        init_comp_def(ctx.accounts, None, None)?;
-        Ok(())
-    }
+Standard Anchor program that orchestrates computation queuing and callback handling:
 
-    pub fn add_together(
-        ctx: Context<AddTogether>,
-        computation_offset: u64,
-        ciphertext_0: [u8; 32],
-        ciphertext_1: [u8; 32],
-        pubkey: [u8; 32],
-        nonce: u128,
-    ) -> Result<()> {
-        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
-        let args = ArgBuilder::new()
-            .x25519_pubkey(pubkey)
-            .plaintext_u128(nonce)
-            .encrypted_u8(ciphertext_0)
-            .encrypted_u8(ciphertext_1)
-            .build();
+- **`init_salt`** — Queues MPC computation, callback stores encrypted salt in a PDA
+- **`store_wallet`** — Passes encrypted wallet + on-chain salt reference to MPC, emits commitment via event
+- **`verify_wallet`** — Passes encrypted wallet + commitment + salt reference, emits match result via event
 
-        queue_computation(
-            ctx.accounts,
-            computation_offset,
-            args,
-            vec![AddTogetherCallback::callback_ix(
-                computation_offset,
-                &ctx.accounts.mxe_account,
-                &[]
-            )?],
-            1,
-            0,
-        )?;
-        Ok(())
-    }
+### On-chain accounts
 
-    #[arcium_callback(encrypted_ix = "add_together")]
-    pub fn add_together_callback(
-        ctx: Context<AddTogetherCallback>,
-        output: SignedComputationOutputs<AddTogetherOutput>,
-    ) -> Result<()> {
-        let o = match output.verify_output(&ctx.accounts.cluster_account, &ctx.accounts.computation_account) {
-            Ok(AddTogetherOutput { field_0 }) => field_0,
-            Err(_) => return Err(ErrorCode::AbortedComputation.into()),
-        };
+| Account | Seeds | Description |
+|---------|-------|-------------|
+| `SaltAccount` | `["salt"]` | Stores MXE-encrypted salt (nonce + 2 ciphertexts) |
 
-        emit!(SumEvent {
-            sum: o.ciphertexts[0],
-            nonce: o.nonce.to_le_bytes(),
-        });
-        Ok(())
-    }
-}
+## Prerequisites
 
-#[queue_computation_accounts("add_together", payer)]
-#[derive(Accounts)]
-#[instruction(computation_offset: u64)]
-pub struct AddTogether<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    // ... other required accounts
-}
+Before running the installation script, make sure you have these dependencies installed:
 
-#[callback_accounts("add_together")]
-#[derive(Accounts)]
-pub struct AddTogetherCallback<'info> {
-    // ... required accounts
-    pub some_extra_acc: AccountInfo<'info>,
-}
+- **Rust** — [Install](https://www.rust-lang.org/tools/install)
+- **Solana CLI 2.3.0** — [Install](https://docs.solanalabs.com/cli/install), then run `solana-keygen new`
+- **Yarn** — [Install](https://yarnpkg.com/getting-started/install)
+- **Anchor 0.32.1** — [Install](https://www.anchor-lang.com/docs/installation)
+- **Docker & Docker Compose** — [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/)
 
-#[init_computation_definition_accounts("add_together", payer)]
-#[derive(Accounts)]
-pub struct InitAddTogetherCompDef<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    // ... other required accounts
-}
+Then install the Arcium CLI:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSfL https://install.arcium.com/ | bash
+```
+
+## Build
+
+```bash
+arcium build
+```
+
+## Test
+
+**On Apple Silicon (M1/M2/M3):**
+
+```bash
+./run_test.sh
+```
+
+This script automatically pulls the correct `linux/amd64` Docker images before running tests, since Arcium's Docker images don't have native ARM64 builds.
+
+**On x86_64:**
+
+```bash
+arcium test
+```
+
+### Expected output
+
+```
+  EncryptedLink
+    ✔ Initializes salt (16s)
+    ✔ Stores a wallet commitment (signup) (4s)
+    ✔ Verifies correct wallet (signin — match) (4s)
+    ✔ Rejects wrong wallet (signin — no match) (4s)
+
+  4 passing (28s)
+```
+
+## Technical details
+
+### Encryption types
+
+| Type | Description |
+|------|-------------|
+| `Enc<Shared, T>` | Client-encrypted data (x25519 shared secret). Both client and MPC can decrypt. |
+| `Enc<Mxe, T>` | MXE-encrypted output. Only the MPC cluster can decrypt. Stored on-chain. |
+| `Enc<Mxe, &T>` | Reference to existing MXE-encrypted on-chain data. MPC reads it directly from the Solana account. |
+
+### Hash construction
+
+The commitment is computed inside the MPC as:
+
+```
+commitment = SHA3-256(wallet_lo ‖ wallet_hi ‖ salt_lo ‖ salt_hi)
+```
+
+Where `wallet_lo`/`wallet_hi` and `salt_lo`/`salt_hi` are the lower/upper 16 bytes (as `u128`) of the 32-byte wallet public key and salt respectively. The 32-byte hash output is split into two `u128` values (`lo`/`hi`) for efficient on-chain storage as 2 ciphertexts instead of 32.
+
+### Callback flow
+
+```
+Client                    Solana Program              Arcium MPC
+  │                            │                          │
+  ├── store_wallet(enc_data) ──►│                          │
+  │                            ├── queue_computation() ───►│
+  │                            │                          ├── decrypt inputs
+  │                            │                          ├── read salt from chain
+  │                            │                          ├── SHA3_256(wallet||salt)
+  │                            │                          ├── encrypt result
+  │                            │◄── callback(output) ──────┤
+  │                            ├── emit WalletStored event │
+  │◄── event (commitment) ─────┤                          │
 ```
