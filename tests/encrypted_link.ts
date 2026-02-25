@@ -5,7 +5,6 @@ import { EncryptedLink } from "../target/types/encrypted_link";
 import { randomBytes } from "crypto";
 import {
   awaitComputationFinalization,
-  getArciumEnv,
   getCompDefAccOffset,
   getArciumAccountBaseSeed,
   getArciumProgramId,
@@ -26,6 +25,8 @@ import {
 import * as fs from "fs";
 import * as os from "os";
 import { expect } from "chai";
+
+const clusterOffset = 456;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -75,36 +76,46 @@ async function initCompDef(
   provider: anchor.AnchorProvider,
   circuitName: string,
   methodName: string
-): Promise<string> {
-  const baseSeedCompDefAcc = getArciumAccountBaseSeed(
-    "ComputationDefinitionAccount"
-  );
-  const offset = getCompDefAccOffset(circuitName);
+): Promise<void> {
+  // Step 1: Create comp def (skip if already exists)
+  try {
+    const baseSeedCompDefAcc = getArciumAccountBaseSeed(
+      "ComputationDefinitionAccount"
+    );
+    const offset = getCompDefAccOffset(circuitName);
 
-  const compDefPDA = PublicKey.findProgramAddressSync(
-    [baseSeedCompDefAcc, program.programId.toBuffer(), offset],
-    getArciumProgramId()
-  )[0];
+    const compDefPDA = PublicKey.findProgramAddressSync(
+      [baseSeedCompDefAcc, program.programId.toBuffer(), offset],
+      getArciumProgramId()
+    )[0];
 
-  const mxeAccount = getMXEAccAddress(program.programId);
-  const mxeAcc = await arciumProgram.account.mxeAccount.fetch(mxeAccount);
-  const lutAddress = getLookupTableAddress(
-    program.programId,
-    mxeAcc.lutOffsetSlot
-  );
+    const mxeAccount = getMXEAccAddress(program.programId);
+    const mxeAcc = await arciumProgram.account.mxeAccount.fetch(mxeAccount);
+    const lutAddress = getLookupTableAddress(
+      program.programId,
+      mxeAcc.lutOffsetSlot
+    );
 
-  const sig = await program.methods[methodName]()
-    .accounts({
-      compDefAccount: compDefPDA,
-      payer: owner.publicKey,
-      mxeAccount,
-      addressLookupTable: lutAddress,
-    })
-    .signers([owner])
-    .rpc({ commitment: "confirmed" });
+    const sig = await program.methods[methodName]()
+      .accounts({
+        compDefAccount: compDefPDA,
+        payer: owner.publicKey,
+        mxeAccount,
+        addressLookupTable: lutAddress,
+      })
+      .signers([owner])
+      .rpc({ commitment: "confirmed" });
 
-  console.log(`Init ${circuitName} comp def tx:`, sig);
+    console.log(`Init ${circuitName} comp def tx:`, sig);
+  } catch (e: any) {
+    if (e.toString().includes("already in use")) {
+      console.log(`Comp def "${circuitName}" already exists, skipping.`);
+    } else {
+      throw e;
+    }
+  }
 
+  // Step 2: Upload circuit (always attempt)
   const rawCircuit = fs.readFileSync(`build/${circuitName}.arcis`);
   await uploadCircuit(
     provider,
@@ -113,8 +124,7 @@ async function initCompDef(
     rawCircuit,
     true
   );
-
-  return sig;
+  console.log(`Circuit "${circuitName}" uploaded.`);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -126,9 +136,7 @@ describe("EncryptedLink", () => {
     .EncryptedLink as Program<EncryptedLink>;
   const provider = anchor.getProvider() as anchor.AnchorProvider;
   const arciumProgram = getArciumProgram(provider);
-  const arciumEnv = getArciumEnv();
-
-  const clusterAccount = getClusterAccAddress(arciumEnv.arciumClusterOffset);
+  const clusterAccount = getClusterAccAddress(clusterOffset);
   const mxeAccount = getMXEAccAddress(program.programId);
 
   // Salt PDA
@@ -163,45 +171,29 @@ describe("EncryptedLink", () => {
   it("Initializes salt", async () => {
     const owner = readKpJson(`${os.homedir()}/.config/solana/id.json`);
 
-    // 1. Register all computation definitions
-    console.log("Registering computation definitions...");
-    await initCompDef(
-      program, arciumProgram, owner, provider,
-      "init_salt", "initInitSaltCompDef"
-    );
-    await initCompDef(
-      program, arciumProgram, owner, provider,
-      "store_wallet", "initStoreWalletCompDef"
-    );
-    await initCompDef(
-      program, arciumProgram, owner, provider,
-      "verify_wallet", "initVerifyWalletCompDef"
-    );
-    console.log("All computation definitions registered.");
+    // 1. Register comp defs + upload circuits (skips comp def if already exists)
+    await initCompDef(program, arciumProgram, owner, provider, "init_salt", "initInitSaltCompDef");
+    await initCompDef(program, arciumProgram, owner, provider, "store_wallet", "initStoreWalletCompDef");
+    await initCompDef(program, arciumProgram, owner, provider, "verify_wallet", "initVerifyWalletCompDef");
+    console.log("All computation definitions ready.");
 
-    // 2. Get MXE public key
     mxePublicKey = await getMXEPublicKeyWithRetry(provider, program.programId);
     console.log("MXE x25519 pubkey fetched.");
 
-    // 3. Setup encryption
     const privateKey = x25519.utils.randomSecretKey();
     const publicKey = x25519.getPublicKey(privateKey);
     const sharedSecret = x25519.getSharedSecret(privateKey, mxePublicKey);
     const cipher = new RescueCipher(sharedSecret);
 
-    // 4. Generate random salt (32 bytes = 2x u128)
     const salt = randomBytes(32);
     const saltLo = deserializeLE(salt.slice(0, 16));
     const saltHi = deserializeLE(salt.slice(16, 32));
 
-    // 5. Encrypt
     const nonce = randomBytes(16);
     const ciphertext = cipher.encrypt([saltLo, saltHi], nonce);
 
-    // 6. Listen for event
     const eventPromise = awaitEvent("saltInitialized");
 
-    // 7. Call init_salt
     const computationOffset = new anchor.BN(randomBytes(8), "hex");
     console.log("Computation offset: ", computationOffset);
 
@@ -216,15 +208,13 @@ describe("EncryptedLink", () => {
       .accountsPartial({
         saltAccount: saltPDA,
         computationAccount: getComputationAccAddress(
-          arciumEnv.arciumClusterOffset,
+          clusterOffset,
           computationOffset
         ),
         clusterAccount,
         mxeAccount,
-        mempoolAccount: getMempoolAccAddress(arciumEnv.arciumClusterOffset),
-        executingPool: getExecutingPoolAccAddress(
-          arciumEnv.arciumClusterOffset
-        ),
+        mempoolAccount: getMempoolAccAddress(clusterOffset),
+        executingPool: getExecutingPoolAccAddress(clusterOffset),
         compDefAccount: getCompDefAccAddress(
           program.programId,
           Buffer.from(getCompDefAccOffset("init_salt")).readUInt32LE()
@@ -279,15 +269,13 @@ describe("EncryptedLink", () => {
       .accountsPartial({
         saltAccount: saltPDA,
         computationAccount: getComputationAccAddress(
-          arciumEnv.arciumClusterOffset,
+          clusterOffset,
           computationOffset
         ),
         clusterAccount,
         mxeAccount,
-        mempoolAccount: getMempoolAccAddress(arciumEnv.arciumClusterOffset),
-        executingPool: getExecutingPoolAccAddress(
-          arciumEnv.arciumClusterOffset
-        ),
+        mempoolAccount: getMempoolAccAddress(clusterOffset),
+        executingPool: getExecutingPoolAccAddress(clusterOffset),
         compDefAccount: getCompDefAccAddress(
           program.programId,
           Buffer.from(getCompDefAccOffset("store_wallet")).readUInt32LE()
@@ -353,15 +341,13 @@ describe("EncryptedLink", () => {
       .accountsPartial({
         saltAccount: saltPDA,
         computationAccount: getComputationAccAddress(
-          arciumEnv.arciumClusterOffset,
+          clusterOffset,
           computationOffset
         ),
         clusterAccount,
         mxeAccount,
-        mempoolAccount: getMempoolAccAddress(arciumEnv.arciumClusterOffset),
-        executingPool: getExecutingPoolAccAddress(
-          arciumEnv.arciumClusterOffset
-        ),
+        mempoolAccount: getMempoolAccAddress(clusterOffset),
+        executingPool: getExecutingPoolAccAddress(clusterOffset),
         compDefAccount: getCompDefAccAddress(
           program.programId,
           Buffer.from(getCompDefAccOffset("verify_wallet")).readUInt32LE()
@@ -421,15 +407,13 @@ describe("EncryptedLink", () => {
       .accountsPartial({
         saltAccount: saltPDA,
         computationAccount: getComputationAccAddress(
-          arciumEnv.arciumClusterOffset,
+          clusterOffset,
           computationOffset
         ),
         clusterAccount,
         mxeAccount,
-        mempoolAccount: getMempoolAccAddress(arciumEnv.arciumClusterOffset),
-        executingPool: getExecutingPoolAccAddress(
-          arciumEnv.arciumClusterOffset
-        ),
+        mempoolAccount: getMempoolAccAddress(clusterOffset),
+        executingPool: getExecutingPoolAccAddress(clusterOffset),
         compDefAccount: getCompDefAccAddress(
           program.programId,
           Buffer.from(getCompDefAccOffset("verify_wallet")).readUInt32LE()

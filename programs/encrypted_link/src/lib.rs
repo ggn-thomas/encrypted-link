@@ -39,10 +39,6 @@ pub mod encrypted_link {
         pubkey: [u8; 32],
         nonce: u128,
     ) -> Result<()> {
-        require!(
-            !ctx.accounts.salt_account.is_initialized,
-            ErrorCode::SaltAlreadyInitialized
-        );
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
 
         let args = ArgBuilder::new()
@@ -181,8 +177,8 @@ pub mod encrypted_link {
             .plaintext_u128(ctx.accounts.salt_account.nonce)
             .account(
                 ctx.accounts.salt_account.key(),
-                8 + 1 + 16, // discriminator + is_initialized + nonce
-                32 * 2,     // salt_lo + salt_hi
+                8 + 1 + 16,
+                32 * 2,
             )
             .build();
 
@@ -258,8 +254,6 @@ pub enum ErrorCode {
     AbortedComputation,
     #[msg("Cluster not set")]
     ClusterNotSet,
-    #[msg("Salt already initialized")]
-    SaltAlreadyInitialized,
     #[msg("Salt not initialized")]
     SaltNotInitialized,
 }
@@ -335,7 +329,7 @@ pub struct InitSalt<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(
-        init_if_needed,
+        init,
         space = 8 + 1 + 16 + 32 + 32,
         payer = payer,
         seeds = [b"salt"],

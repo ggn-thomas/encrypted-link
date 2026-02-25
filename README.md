@@ -53,7 +53,7 @@ Written in [Arcis](https://docs.arcium.com/developers/arcis), Arcium's Rust-base
 Standard Anchor program that orchestrates computation queuing and callback handling:
 
 - **`init_salt`** — Queues MPC computation, callback stores encrypted salt in a PDA
-- **`store_wallet`** — Passes encrypted wallet + on-chain salt reference to MPC, emits commitment via event
+- **`store_wallet`** — Passes enc5ypted wallet + on-chain salt reference to MPC, emits commitment via event
 - **`verify_wallet`** — Passes encrypted wallet + commitment + salt reference, emits match result via event
 
 ### On-chain accounts
@@ -86,8 +86,9 @@ arcium build
 
 ## Test
 
-**On Apple Silicon (M1/M2/M3):**
+**On Apple Silicon (M1/M2/M3/M..):**
 
+localnet
 ```bash
 ./run_test.sh
 ```
@@ -99,6 +100,9 @@ This script automatically pulls the correct `linux/amd64` Docker images before r
 ```bash
 arcium test
 ```
+
+devnet
+arcium test --cluster devnet
 
 ### Expected output
 

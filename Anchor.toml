@@ -5,14 +5,14 @@ package_manager = "yarn"
 resolution = true
 skip-lint = false
 
-[programs.localnet]
+[programs.devnet]
 encrypted_link = "6YSDocmEoLjFbxCY7YMpr8WNiPsx9V6x3xogmuAC5QWX"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "localnet"
+cluster = "https://devnet.helius-rpc.com/?api-key=62ba0192-6652-43f1-a243-5c08cb3b7b25"
 wallet = "~/.config/solana/id.json"
 
 [test]
